@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,18 +43,53 @@ var (
 var (
 	access_key string
 	secret_key string
-	end_point  string
-	bucket     string
 	sess       *session.Session
 	svc        *s3.S3
+	reteion    int64 //save s3 object min
+	tickMin    int   //tick of min
 )
 
 func init() {
 	access_key = os.Getenv("AWS_ACCESS_KEY_ID")
 	secret_key = os.Getenv("AWS_SECRET_ACCESS_KEY")
+	reteionstr := os.Getenv("RETION")
+	if reteionstr == "" {
+		reteionstr = "30d"
+	}
+	reteiont, err := time.ParseDuration(reteionstr)
+	if err != nil {
+		panic(err)
+	}
+	reteion = int64(reteiont.Minutes())
+	tickMinStr := os.Getenv("TICK_MIN")
+	if tickMinStr == "" {
+		tickMinStr = "60"
+	}
+	tickMin, err = strconv.Atoi(tickMinStr)
+	if err != nil {
+		panic(err)
+	}
+
 }
 
-func clean() {
+func clean(ep string) {
+	if sess == nil {
+		sesst, err := session.NewSession(&aws.Config{
+			Credentials:      credentials.NewStaticCredentials(access_key, secret_key, ""),
+			Endpoint:         aws.String(ep),
+			Region:           aws.String("hongkong"),
+			DisableSSL:       aws.Bool(true),
+			S3ForcePathStyle: aws.Bool(true), //virtual-host style
+		})
+		if err != nil {
+			panic(err)
+		}
+		sess = sesst
+	}
+	if svc == nil {
+		svc = s3.New(sess)
+	}
+
 	buckResp, _ := svc.ListBuckets(&s3.ListBucketsInput{})
 	for _, bt := range buckResp.Buckets {
 		fmt.Println(*bt.Name)
@@ -64,14 +100,22 @@ func clean() {
 		if err != nil {
 			panic(err)
 		}
+		now := time.Now().Add(-time.Minute * time.Duration(reteion))
 		for _, item := range resp.Contents {
-			fmt.Println("Name:         ", *item.Key)
-			fmt.Println("Last modified:", *item.LastModified)
-			fmt.Println("Size:         ", *item.Size)
-			fmt.Println("Storage class:", *item.StorageClass)
-			fmt.Println("")
+			if item.LastModified.Before(now) {
+				log.Printf("begin.delete:%s,LastModified:%s\n", *item.Key, item.LastModified.Format("2006-01-02 15:04:05"))
+				doi := &s3.DeleteObjectInput{
+					Bucket: aws.String(*bt.Name),
+					Key:    item.Key,
+				}
+				_, err := svc.DeleteObject(doi)
+				if err != nil {
+					// panic(err)
+					log.Println("delete.s3.object.faile!", err)
+					continue
+				}
+			}
 		}
-
 	}
 	log.Println("bucket.size:", len(buckResp.Buckets))
 }
@@ -97,61 +141,40 @@ func main() {
 			}
 		}
 		logger.Infof("Snapshot delete url %s", *snapshotDeleteURL)
-
-		name, err := snapshot.Create(*snapshotCreateURL)
-		if err != nil {
-			logger.Fatalf("cannot create snapshot: %s", err)
-		}
-		err = flag.Set("snapshotName", name)
-		if err != nil {
-			logger.Fatalf("cannot set snapshotName flag: %v", err)
-		}
-
-		defer func() {
-			err := snapshot.Delete(*snapshotDeleteURL, name)
-			if err != nil {
-				logger.Fatalf("cannot delete snapshot: %s", err)
-			}
-		}()
 	}
 
-	dstFS, err := newDstFS(bucket)
-	if err != nil {
-		logger.Fatalf("%s", err)
-	}
-	s := dstFS.(*s3remote.FS)
-	log.Println("===================", s.CustomEndpoint, s.Bucket)
-	end_point = s.CustomEndpoint
-	bucket = s.Bucket
+	go beginBackup()
 
-	sess, err := session.NewSession(&aws.Config{
-		Credentials:      credentials.NewStaticCredentials(access_key, secret_key, ""),
-		Endpoint:         aws.String(end_point),
-		Region:           aws.String("hongkong"),
-		DisableSSL:       aws.Bool(true),
-		S3ForcePathStyle: aws.Bool(false), //virtual-host style方式，不要修改
-	})
-	if err != nil {
-		panic(err)
-	}
-	svc = s3.New(sess)
-
-	log.Println("end_point:", end_point)
-	clean()
-
-	c := time.Tick(5 * time.Second)
+	c := time.Tick(time.Duration(tickMin) * time.Minute)
 	go func() {
 		for {
 			<-c
-			go clean()
+			go beginBackup()
 		}
 	}()
-
-	beginBackup()
 	select {}
 }
 
 func beginBackup() {
+
+	logger.Infof("Snapshot delete url %s", *snapshotDeleteURL)
+
+	name, err := snapshot.Create(*snapshotCreateURL)
+	if err != nil {
+		logger.Fatalf("cannot create snapshot: %s", err)
+	}
+	err = flag.Set("snapshotName", name)
+	if err != nil {
+		logger.Fatalf("cannot set snapshotName flag: %v", err)
+	}
+
+	defer func() {
+		err := snapshot.Delete(*snapshotDeleteURL, name)
+		if err != nil {
+			logger.Fatalf("cannot delete snapshot: %s", err)
+		}
+	}()
+
 	dayhour := time.Now().Format("2006-01-02-15-04")
 	bucket := *dst + "/" + dayhour
 	srcFS, err := newSrcFS()
@@ -163,12 +186,13 @@ func beginBackup() {
 		logger.Fatalf("%s", err)
 	}
 
-	// newFs(*dst)
 	dstFS, err := newDstFS(bucket)
 	if err != nil {
 		logger.Fatalf("%s", err)
 	}
-	//TODO init s3 client
+	s := dstFS.(*s3remote.FS)
+	go clean(s.CustomEndpoint)
+
 	a := &actions.Backup{
 		Concurrency: *concurrency,
 		Src:         srcFS,
