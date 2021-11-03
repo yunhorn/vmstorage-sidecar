@@ -1,0 +1,4 @@
+# vmbackup-sidecar
+用于vmstorage的sidecar,定时备份vmstorage的数据到s3以及定时清理过时的s3数据.
+
+代码基于https://github.com/VictoriaMetrics/VictoriaMetrics/tree/1a16dab9e1fd6a99d427ea2986b3b7abb402df5d/app/vmbackup实现,感谢VictoriaMetrics社区的努力!
